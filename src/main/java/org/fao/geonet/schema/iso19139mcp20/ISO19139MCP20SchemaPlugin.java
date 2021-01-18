@@ -26,16 +26,32 @@ package org.fao.geonet.schema.iso19139mcp20;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.apache.commons.lang.StringUtils;
-import org.fao.geonet.kernel.schema.*;
+import org.fao.geonet.kernel.schema.AssociatedResource;
+import org.fao.geonet.kernel.schema.AssociatedResourcesSchemaPlugin;
+import org.fao.geonet.kernel.schema.ExportablePlugin;
+import org.fao.geonet.kernel.schema.ISOPlugin;
+import org.fao.geonet.kernel.schema.LinkAwareSchemaPlugin;
+import org.fao.geonet.kernel.schema.LinkPatternStreamer.ILinkBuilder;
+import org.fao.geonet.kernel.schema.LinkPatternStreamer.RawLinkPatternStreamer;
+import org.fao.geonet.kernel.schema.MultilingualSchemaPlugin;
+import org.fao.geonet.kernel.schema.SchemaPlugin;
 import org.fao.geonet.utils.Log;
 import org.fao.geonet.utils.Xml;
+import org.jdom.Attribute;
 import org.jdom.Element;
 import org.jdom.JDOMException;
 import org.jdom.Namespace;
 import org.jdom.filter.ElementFilter;
 import org.jdom.xpath.XPath;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 import static org.fao.geonet.schema.iso19139.ISO19139Namespaces.GCO;
 import static org.fao.geonet.schema.iso19139.ISO19139Namespaces.GMD;
@@ -52,7 +68,8 @@ public class ISO19139MCP20SchemaPlugin
     AssociatedResourcesSchemaPlugin,
     MultilingualSchemaPlugin,
     ExportablePlugin,
-    ISOPlugin {
+    ISOPlugin,
+    LinkAwareSchemaPlugin {
     public static final String IDENTIFIER = "iso19139.mcp-2.0";
 
     private static ImmutableSet<Namespace> allNamespaces;
@@ -272,6 +289,7 @@ public class ISO19139MCP20SchemaPlugin
         }
 
         // Remove unused lang entries
+        // eg. the directory entry contains more languages than requested.
         List<Element> translationNodes = (List<Element>)Xml.selectNodes(element, "*//node()[@locale]");
         for(Element el : translationNodes) {
             // Remove all translations if there is no or only one language requested
@@ -289,8 +307,35 @@ public class ISO19139MCP20SchemaPlugin
             }
         }
 
+        // Sort all children elements translation
+        // according to the language list.
+        // When a directory entry is added as an xlink, the URL
+        // contains an ordered list of language and this ordre must
+        // be preserved in order to display fields in the editor in the same
+        // order as other element in the record.
+        if (langs.size() > 1) {
+            List<Element> elementList = (List<Element>)Xml.selectNodes(element,
+                                        ".//*[gmd:PT_FreeText]",
+                                               Arrays.asList(GMD));
+            for(Element el : elementList) {
+                final Element ptFreeText = el.getChild("PT_FreeText", GMD);
+                List<Element> orderedTextGroup = new ArrayList<>();
+                for (String l : langs) {
+                    List<Element> node = (List<Element>) Xml.selectNodes(ptFreeText, "gmd:textGroup[*/@locale='" + l + "']", Arrays.asList(GMD));
+                    if (node != null && node.size() == 1) {
+                        orderedTextGroup.add((Element) node.get(0).clone());
+                    }
+                }
+                ptFreeText.removeContent();
+                ptFreeText.addContent(orderedTextGroup);
+            }
+        }
+
+
         return element;
     }
+
+
     @Override
     public String getBasicTypeCharacterStringName() {
         return "gco:CharacterString";
@@ -409,5 +454,86 @@ public class ISO19139MCP20SchemaPlugin
     @Override
     public Map<String, String> getExportFormats() {
         return allExportFormats;
+    }
+
+    /**
+     * Process some of the ISO elements which can have substitute.
+     *
+     * For example, a CharacterString can have a gmx:Anchor as a substitute
+     * to encode a text value + an extra URL. To make the transition between
+     * CharacterString and Anchor transparent, this method takes care of
+     * creating the appropriate element depending on the presence of an xlink:href attribute.
+     * If the attribute is empty, then a CharacterString is used, if a value is set, an Anchor is created.
+     *
+     * @param el element to process.
+     * @param attributeRef the attribute reference
+     * @param parsedAttributeName the name of the attribute, for example <code>xlink:href</code>
+     * @param attributeValue the attribute value
+     * @return
+     */
+    @Override
+    public Element processElement(Element el,
+                                  String attributeRef,
+                                  String parsedAttributeName,
+                                  String attributeValue) {
+        if (Log.isDebugEnabled(LOGGER_NAME)) {
+            Log.debug(LOGGER_NAME, String.format(
+                "Processing element %s, attribute %s with attributeValue %s.",
+                    el, attributeRef, attributeValue));
+        }
+
+        boolean elementToProcess = isElementToProcess(el);
+
+        if (elementToProcess && parsedAttributeName.equals("xlink:href")) {
+            boolean isEmptyLink = StringUtils.isEmpty(attributeValue);
+            boolean isMultilingualElement = el.getName().equals("LocalisedCharacterString");
+
+            if (isMultilingualElement) {
+                // The attribute provided relates to the CharacterString and not to the LocalisedCharacterString
+                Element targetElement = el.getParentElement().getParentElement().getParentElement()
+                                            .getChild("CharacterString", GCO);
+                if (targetElement != null) {
+                    el = targetElement;
+                }
+            }
+
+            if (isEmptyLink) {
+                el.setNamespace(GCO).setName("CharacterString");
+                el.removeAttribute("href", XLINK);
+                return el;
+            } else {
+                el.setNamespace(GMX).setName("Anchor");
+                el.setAttribute("href", "", XLINK);
+                return el;
+            }
+        } else if (elementToProcess && StringUtils.isNotEmpty(parsedAttributeName) &&
+            parsedAttributeName.startsWith(":")) {
+            // eg. :codeSpace
+            el.setAttribute(parsedAttributeName.substring(1), attributeValue);
+            return el;
+        } else {
+            return super.processElement(el, attributeRef, parsedAttributeName, attributeValue);
+        }
+
+    }
+
+    /**
+     * Checks if an element requires processing in {@link #processElement(Element, String, String, String)}.
+     *
+     * @param el Element to check.
+     *
+     * @return boolean indicating if the element requires processing or not.
+     */
+    protected boolean isElementToProcess(Element el) {
+        if (el == null) return false;
+
+        return elementsToProcess.contains(el.getQualifiedName());
+    }
+
+    public <L, M> RawLinkPatternStreamer<L, M> createLinkStreamer(ILinkBuilder<L, M> linkbuilder) {
+        RawLinkPatternStreamer patternStreamer = new RawLinkPatternStreamer(linkbuilder);
+        patternStreamer.setNamespaces(ISO19139MCP20SchemaPlugin.allNamespaces.asList());
+        patternStreamer.setRawTextXPath(".//*[name() = 'gco:CharacterString' or name() = 'gmd:URL']");
+        return patternStreamer;
     }
 }
